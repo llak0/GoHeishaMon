@@ -1,3 +1,135 @@
+# This repo is a personal WIP
+It's only meant to get the project running in a quick and dirty way.
+
+The only differences between the upstream by @pando85 and this repo are the following notes, listed under "Known issues and mitigations". You can also find the binaries needed for the install in the releases section.
+
+Use it at your own risk: you may damage your device or your heatpump.
+
+That being said, I hope these notes help others.
+
+## Known issues and mitigations
+The goheishamon process fails for unknown reasons every so often (every 12-36h). Here's a modification to the goheishamon daemon definition, and a wrapper for the goheishamon binary. Please note the delay in the start (`sleep 60`), needed to allow the networking configuration to be complete.
+
+1. Make sure you follow the configuration process for the USB drive, including the correct connection and MQTT host data.
+2. Open http://your_CZ-TAW1_IP/ in your browser
+3. In the top menu, go to System > Startup. Start the "goheishamon" process.
+4. Wait a few seconds for the device to reach your MQTT server.
+5. Launch dropbear, issuing an MQTT message with the topic `panasonic_heat_pump/commands/OSCommand` and the payload `/usr/sbin/dropbear`
+6. In your terminal: `ssh -oKexAlgorithms=+diffie-hellman-group1-sha1 -oHostKeyAlgorithms=+ssh-rsa root@your_CZ-TAW1_IP`
+7. Modify/create the next files:
+
+`/etc/gh/goheishamon_wrapper.sh`:
+```
+#!/bin/sh
+
+# Allow for startup to finish
+
+sleep 60
+
+while true; do
+    /usr/bin/goheishamon 2>&1 | {
+        CRASH_TOTAL=0
+        LINES_PROCESSED=0
+
+        while IFS= read -r line; do
+            # Log each line via logger AND echo it (for procd)
+            echo "$line"
+            logger -t goheishamon "$line"
+
+            # Check conditions
+            if echo "$line" | grep -q "out of time"; then
+                logger -t goheishamon "Detected 'out of time' - triggering restart"
+                exit 1
+            fi
+
+            if echo "$line" | grep -q "71 6C 01 10 00 00 00 00"; then
+                logger -t goheishamon "Detected crash code"
+                CRASH_TOTAL=$((CRASH_TOTAL + 1))
+            fi
+
+            LINES_PROCESSED=$((LINES_PROCESSED + 1))
+
+            # Check every 30 lines
+            if [ $LINES_PROCESSED -ge 30 ]; then
+                if [ $CRASH_TOTAL -ge 10 ]; then
+                    logger -t goheishamon "CRITICAL: Detected $CRASH_TOTAL crash codes in last 30 lines - triggering restart"
+                    exit 1
+                fi
+                # Reset counters
+                CRASH_TOTAL=0
+                LINES_PROCESSED=0
+            fi
+        done
+        exit 0
+    }
+
+    EXIT_CODE=$?
+    sleep 2
+done
+```
+
+`/etc/init.d/goheishamon`:
+```
+#!/bin/sh /etc/rc.common
+# "new(er)" style init script
+# Look at /lib/functions/service.sh on a running system for explanations of what other SERVICE_
+# options you can use, and when you might want them.
+
+USE_PROCD=1
+START=22
+
+start_service() {
+        logger -t goheishamon "Starting service"
+        [ -e /etc/config/goheishamon.toml ] || return 1
+        procd_open_instance
+
+        procd_set_param command /etc/gh/goheishamon_wrapper.sh    
+        procd_set_param respawn ${respawn_threshold:-600} ${respawn_timeout:-10} ${respawn_retry:-40}
+        procd_set_param file /etc/config/goheishamon.toml
+        procd_set_param pidfile /var/run/goheishamon_wrapper.pid
+        procd_set_param stdout 1
+        procd_set_param stderr 1
+
+        procd_close_instance
+}
+
+stop_service() {
+        logger -t goheishamon "Stopping service"
+        procd_kill
+        [ -e /var/run/goheishamon_wrapper.pid ] && rm -f /var/run/goheishamon_wrapper.pid
+        logger -t goheishamon "Service stopped"
+```
+
+`/etc/rc.local`:
+```
+# Put your custom commands here that should be executed once
+# the system init finished. By default this file does nothing.
+
+logger "Start watchdog"
+echo 300 > /proc/sys/kernel/panic
+echo 0 > /proc/sys/kernel/panic_on_oops
+
+(/usr/bin/check_buttons.sh > /dev/null 2>&1) &
+
+logger -t rc.local "Execute nextboot.sh"
+/etc/gh/nextboot.sh
+
+logger -t rc.local "Clean nextboot.sh"
+echo "" > /etc/gh/nextboot.sh
+
+# New script to try to start the goheishamon daemon if it's not functional
+/etc/init.d/goheishamon start
+
+# Guarantee ssh access, even if goheishamon is not pulling MQTT commands
+/usr/sbin/dropbear
+
+#/usr/bin/a2wmain > /dev/ttyS0
+#exit 0
+
+```
+
+
+
 # CZ-TAW1/CZ-TAW1B
 
 This project is to modify Panasonic CZ-TAW1 Firmware to send data from heat pump to MQTT instead to
